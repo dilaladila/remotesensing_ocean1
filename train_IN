@@ -25,7 +25,7 @@ plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ====================== 输出目录 ======================
-save_dir = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/temp/inorg_n_plots/"
+save_dir = r
 os.makedirs(save_dir, exist_ok=True)
 log_file = f"{save_dir}训练参数与精度记录.txt"
 
@@ -35,7 +35,7 @@ with open(log_file, "w", encoding="utf-8") as f:
 print("【无机氮】升级版 Stacking + 三个模型 Optuna 调参 + 实时绘图")
 
 # ====================== 1. 读取 & 预处理 ======================
-data = pd.read_excel("C:/Users/mlj23/Desktop/shandong_castle_毕设/point/shandong_IN.xls")
+data = pd.read_excel("C:/Users/")
 
 
 def preprocess_data(df):
