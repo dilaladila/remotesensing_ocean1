@@ -1,0 +1,2 @@
+# remotesensing_ocean1
+本项目适用于遥感水质参数反演，以山东近岸海域为研究区，选取2019-2025年多时相Landsat 8/9影像与山东省生态环境厅同步实测无机氮、磷酸盐数据，构建基于XGBoost、LightGBM、CatBoost三模型Stacking集成与Optuna贝叶斯调参的水质遥感反演方法
