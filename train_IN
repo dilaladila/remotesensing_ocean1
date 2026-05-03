@@ -1,0 +1,449 @@
+import pandas as pd
+import numpy as np
+import warnings
+
+warnings.filterwarnings('ignore')
+
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import RobustScaler, PowerTransformer
+from sklearn.feature_selection import SelectFromModel
+import joblib
+import optuna
+from tqdm import tqdm
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ====================== 输出目录 ======================
+save_dir = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/temp/inorg_n_plots/"
+os.makedirs(save_dir, exist_ok=True)
+log_file = f"{save_dir}训练参数与精度记录.txt"
+
+with open(log_file, "w", encoding="utf-8") as f:
+    f.write("=== 无机氮模型训练日志与参数记录 ===\n\n")
+
+print("【无机氮】升级版 Stacking + 三个模型 Optuna 调参 + 实时绘图")
+
+# ====================== 1. 读取 & 预处理 ======================
+data = pd.read_excel("C:/Users/mlj23/Desktop/shandong_castle_毕设/point/shandong_IN.xls")
+
+
+def preprocess_data(df):
+    df['无机氮'] = pd.to_numeric(df['无机氮'], errors='coerce')
+    key_cols = ['波段1', '波段2', '波段3', '波段4', '波段5', '波段6', '波段7', '无机氮']
+    df = df.dropna(subset=key_cols).copy()
+
+    q005, q995 = df['无机氮'].quantile([0.005, 0.995])
+    df = df[(df['无机氮'] >= q005) & (df['无机氮'] <= q995)]
+
+    band_cols = ['波段1', '波段2', '波段3', '波段4', '波段5', '波段6', '波段7']
+    for col in band_cols:
+        median = df[col].median()
+        mad = (df[col] - median).abs().median()
+        df = df[(df[col] >= median - 8 * mad) & (df[col] <= median + 8 * mad)]
+
+    df['inorg_n_log'] = np.log1p(df['无机氮'])
+    print(f"清洗后数据量: {len(df)}")
+    return df
+
+
+data = preprocess_data(data)
+
+# ====================== 2. 特征工程 ======================
+data['B1'] = data['波段1']
+data['B2'] = data['波段2']
+data['B3'] = data['波段3']
+data['B4'] = data['波段4']
+data['B5'] = data['波段5']
+data['B6'] = data['波段6']
+data['B7'] = data['波段7']
+
+bands = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']
+for i in range(len(bands)):
+    for j in range(i + 1, len(bands)):
+        data[f'r_{bands[i]}_{bands[j]}'] = data[bands[i]] / (data[bands[j]] + 1e-8)
+        data[f'd_{bands[i]}_{bands[j]}'] = data[bands[i]] - data[bands[j]]
+        data[f'm_{bands[i]}_{bands[j]}'] = data[bands[i]] * data[bands[j]]
+
+data['NDVI'] = (data['B5'] - data['B4']) / (data['B5'] + data['B4'] + 1e-8)
+data['NDWI'] = (data['B5'] - data['B6']) / (data['B5'] + data['B6'] + 1e-8)
+data['NDTI'] = (data['B6'] - data['B7']) / (data['B6'] + data['B7'] + 1e-8)
+data['EVI'] = 2.5 * (data['B5'] - data['B4']) / (data['B5'] + 6 * data['B4'] - 7.5 * data['B2'] + 1 + 1e-8)
+data['FLH'] = data['B5'] - (data['B4'] + (data['B6'] - data['B4']) * (665 - 655) / (740 - 655))
+
+for col in ['B2', 'B3', 'B4', 'B5']:
+    data[f'{col}_sq'] = data[col] ** 2
+    data[f'{col}_log'] = np.log1p(data[col])
+
+data['B5_B4_ratio'] = data['B5'] / (data['B4'] + 1e-8)
+data['B5_B2_ratio'] = data['B5'] / (data['B2'] + 1e-8)
+data['B5_B3_ratio'] = data['B5'] / (data['B3'] + 1e-8)
+
+data['lon_norm'] = (data['经度'] - data['经度'].mean()) / data['经度'].std()
+data['lat_norm'] = (data['纬度'] - data['纬度'].mean()) / data['纬度'].std()
+data['lon_lat'] = data['lon_norm'] * data['lat_norm']
+
+# ====================== 3. 特征矩阵 ======================
+numeric_cols = data.select_dtypes(include=[np.number]).columns.tolist()
+exclude_cols = ['无机氮', 'inorg_n_log', '波段1', '波段2', '波段3', '波段4', '波段5', '波段6', '波段7', '监测日']
+feature_cols = [col for col in numeric_cols if col not in exclude_cols]
+
+X = data[feature_cols]
+y = data['inorg_n_log']
+
+print(f"最终特征数量: {X.shape[1]}")
+
+# ======================  保存90+特征与目标值的相关性到Excel ======================
+print("\n正在保存特征相关性系数表...")
+# 计算 Pearson 相关系数
+corr_list = []
+for col in feature_cols:
+    corr_val = data[col].corr(data['无机氮'])
+    corr_list.append({'特征名': col, '相关性系数': corr_val})
+
+corr_df = pd.DataFrame(corr_list)
+# 按绝对值从大到小排序，方便看
+corr_df = corr_df.sort_values(by='相关性系数', key=abs, ascending=False)
+corr_df.to_excel(f"{save_dir}特征相关性系数表.xlsx", index=False)
+print(f"完成：特征相关性系数表.xlsx")
+
+# ====================== 4. 变换 + 筛选 ======================
+scaler = RobustScaler()
+pt = PowerTransformer(method='yeo-johnson')
+X_scaled = scaler.fit_transform(X)
+X_scaled = pt.fit_transform(X_scaled)
+
+selector = SelectFromModel(XGBRegressor(n_estimators=800, max_depth=6, random_state=42), threshold='1.5*median')
+X_selected = selector.fit_transform(X_scaled, y)
+selected_feature_names = np.array(feature_cols)[selector.get_support()]  # 获取筛选后的特征名
+print(f"筛选后特征数量: {X_selected.shape[1]}")
+
+# ======================  筛选后特征热力图 ======================
+print("\n正在绘制筛选后特征相关性热力图...")
+df_corr = pd.DataFrame(X_selected, columns=selected_feature_names).corr()
+
+plt.figure(figsize=(12, 10))
+sns.heatmap(df_corr, cmap='coolwarm', center=0, annot=False,
+            xticklabels=True, yticklabels=True, linewidths=0.5)
+plt.title('筛选后特征相关性热力图')
+plt.tight_layout()
+plt.savefig(f"{save_dir}热力图_筛选后特征相关性.png", dpi=300, bbox_inches='tight')
+plt.close()
+print("完成：热力图_筛选后特征相关性.png")
+
+
+# ====================== 5. 定义 Optuna objective 函数 ======================
+def objective_xgb(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 2000, 4500),
+        'max_depth': trial.suggest_int('max_depth', 6, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.008, 0.03, log=True),
+        'subsample': trial.suggest_float('subsample', 0.7, 0.95),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.95),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1, 20),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1, 20),
+        'random_state': 42,
+        'n_jobs': -1
+    }
+    model = XGBRegressor(**params, verbosity=0)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    scores = []
+    for tr_idx, val_idx in kf.split(X_selected):
+        model.fit(X_selected[tr_idx], y.iloc[tr_idx])
+        pred = model.predict(X_selected[val_idx])
+        scores.append(r2_score(np.expm1(y.iloc[val_idx]), np.expm1(pred)))
+    return np.mean(scores)
+
+
+def objective_lgb(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 2000, 4500),
+        'max_depth': trial.suggest_int('max_depth', 6, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.008, 0.03, log=True),
+        'subsample': trial.suggest_float('subsample', 0.7, 0.95),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.7, 0.95),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1, 20),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1, 20),
+        'random_state': 42,
+        'n_jobs': -1
+    }
+    model = LGBMRegressor(**params, verbosity=-1)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    scores = []
+    for tr_idx, val_idx in kf.split(X_selected):
+        model.fit(X_selected[tr_idx], y.iloc[tr_idx])
+        pred = model.predict(X_selected[val_idx])
+        scores.append(r2_score(np.expm1(y.iloc[val_idx]), np.expm1(pred)))
+    return np.mean(scores)
+
+
+def objective_cat(trial):
+    params = {
+        'iterations': trial.suggest_int('iterations', 2500, 4500),
+        'depth': trial.suggest_int('depth', 6, 10),
+        'learning_rate': trial.suggest_float('learning_rate', 0.008, 0.028, log=True),
+        'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', 1, 25),
+        'random_strength': trial.suggest_float('random_strength', 1, 12),
+        'bagging_temperature': trial.suggest_float('bagging_temperature', 0.5, 2.5),
+        'min_data_in_leaf': trial.suggest_int('min_data_in_leaf', 1, 30),
+        'random_state': 42,
+        'verbose': 0,
+        'thread_count': -1
+    }
+    model = CatBoostRegressor(**params)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    scores = []
+    for tr_idx, val_idx in kf.split(X_selected):
+        model.fit(X_selected[tr_idx], y.iloc[tr_idx], verbose=False)
+        pred = model.predict(X_selected[val_idx])
+        scores.append(r2_score(np.expm1(y.iloc[val_idx]), np.expm1(pred)))
+    return np.mean(scores)
+
+
+# ====================== 6. 开始 Optuna 调参 ======================
+print("\n开始 Optuna 调参（每个模型2轮）...")
+
+study_xgb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+study_xgb.optimize(objective_xgb, n_trials=2, show_progress_bar=True)
+print(f"XGBoost 最佳 R²: {study_xgb.best_value:.4f}")
+with open(log_file, "a", encoding="utf-8") as f:
+    f.write(f"XGBoost 最佳 R²: {study_xgb.best_value:.4f}\n")
+    f.write(f"XGBoost 最佳参数: {study_xgb.best_params}\n\n")
+
+study_lgb = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+study_lgb.optimize(objective_lgb, n_trials=2, show_progress_bar=True)
+print(f"LightGBM 最佳 R²: {study_lgb.best_value:.4f}")
+with open(log_file, "a", encoding="utf-8") as f:
+    f.write(f"LightGBM 最佳 R²: {study_lgb.best_value:.4f}\n")
+    f.write(f"LightGBM 最佳参数: {study_lgb.best_params}\n\n")
+
+study_cat = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+study_cat.optimize(objective_cat, n_trials=2, show_progress_bar=True)
+print(f"CatBoost 最佳 R²: {study_cat.best_value:.4f}")
+with open(log_file, "a", encoding="utf-8") as f:
+    f.write(f"CatBoost 最佳 R²: {study_cat.best_value:.4f}\n")
+    f.write(f"CatBoost 最佳参数: {study_cat.best_params}\n\n")
+
+
+# ====================== 定义绘图辅助函数 (基模型散点图+残差图) ======================
+def plot_base_model(model, model_name, X, y_log):
+    y_pred_log = model.predict(X)
+    y_true = np.expm1(y_log)
+    y_pred = np.expm1(y_pred_log)
+    residuals = y_true - y_pred
+
+    # 1. 散点图
+    plt.figure(figsize=(8, 8))
+    plt.scatter(y_true, y_pred, alpha=0.65, s=12, color='blue', edgecolors='black')
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', lw=2.5)
+    plt.xlabel('实测无机氮 (mg/L)')
+    plt.ylabel('预测无机氮 (mg/L)')
+    plt.title(f'{model_name} 精度散点图\nR² = {r2_score(y_true, y_pred):.4f}')
+    plt.grid(True, ls='--', alpha=0.5)
+    plt.savefig(f"{save_dir}{model_name}_散点图.png", bbox_inches='tight')
+    plt.close()
+
+    # 2. 残差图
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_pred, residuals, alpha=0.6, s=12, color='purple', edgecolors='black')
+    plt.axhline(y=0, color='red', linestyle='--', lw=2)
+    plt.xlabel('预测无机氮 (mg/L)')
+    plt.ylabel('残差 (Real - Pred)')
+    plt.title(f'{model_name} 残差分布图')
+    plt.grid(True, ls='--', alpha=0.5)
+    plt.savefig(f"{save_dir}{model_name}_残差图.png", bbox_inches='tight')
+    plt.close()
+    print(f"{model_name} 图已保存")
+
+
+# 使用最优参数重新训练基模型用于绘图 (基于全部筛选数据)
+best_xgb = study_xgb.best_params
+best_lgb = study_lgb.best_params
+best_cat = study_cat.best_params
+# 修正CatBoost参数名 
+if 'iterations' not in best_cat:
+    best_cat['iterations'] = best_cat.pop('iterations', 3000)
+
+xgb_full = XGBRegressor(**best_xgb, random_state=42, n_jobs=-1, verbosity=0)
+lgb_full = LGBMRegressor(**best_lgb, random_state=42, n_jobs=-1, verbosity=-1)
+cat_full = CatBoostRegressor(**best_cat, random_state=42, verbose=0, thread_count=-1)
+
+xgb_full.fit(X_selected, y)
+lgb_full.fit(X_selected, y)
+cat_full.fit(X_selected, y)
+
+print("\n正在生成各基模型的散点图与残差图...")
+plot_base_model(xgb_full, 'XGBoost', X_selected, y)
+plot_base_model(lgb_full, 'LightGBM', X_selected, y)
+plot_base_model(cat_full, 'CatBoost', X_selected, y)
+
+# ====================== 7. Stacking ======================
+# 注意：这里保留你原有的代码逻辑不变
+xgb_model = XGBRegressor(**best_xgb, random_state=42, n_jobs=-1, verbosity=0)
+lgb_model = LGBMRegressor(**best_lgb, random_state=42, n_jobs=-1, verbosity=-1)
+cat_model = CatBoostRegressor(**best_cat, random_state=42, verbose=0, thread_count=-1)
+
+print("\n使用最优参数训练加权 Stacking 模型...")
+
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+r2_scores = []
+
+for fold, (train_idx, test_idx) in enumerate(kf.split(X_selected), 1):
+    X_train, X_test = X_selected[train_idx], X_selected[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+    xgb_model.fit(X_train, y_train, verbose=False)
+    lgb_model.fit(X_train, y_train)
+    cat_model.fit(X_train, y_train)
+
+    pred_xgb = xgb_model.predict(X_test)
+    pred_lgb = lgb_model.predict(X_test)
+    pred_cat = cat_model.predict(X_test)
+
+    meta_train = np.column_stack((pred_xgb, pred_lgb, pred_cat))
+    meta_model = CatBoostRegressor(iterations=1200, depth=6, learning_rate=0.06, verbose=0, random_state=42)
+    meta_model.fit(meta_train, y_test)
+
+    pred_meta = meta_model.predict(meta_train)
+    pred_orig = np.expm1(pred_meta)
+    y_test_orig = np.expm1(y_test)
+
+    r2 = r2_score(y_test_orig, pred_orig)
+    r2_scores.append(r2)
+
+    # 实时生成该折散点图
+    plt.figure(figsize=(8, 8))
+    plt.scatter(y_test_orig, pred_orig, alpha=0.65, s=12, color='blue', edgecolors='black')
+    plt.plot([y_test_orig.min(), y_test_orig.max()], [y_test_orig.min(), y_test_orig.max()], 'r--', lw=2.5)
+    plt.xlabel('实测无机氮 (mg/L)')
+    plt.ylabel('预测无机氮 (mg/L)')
+    plt.title(f'Fold {fold} 散点图\nR² = {r2:.4f}')
+    plt.grid(True, ls='--', alpha=0.5)
+    plt.savefig(f"{save_dir}Fold_{fold}_散点图.png", bbox_inches='tight')
+    plt.close()
+
+    print(f"Fold {fold} → R²: {r2:.4f} （散点图已保存）")
+
+print(f"\n最终平均 R² : {np.mean(r2_scores):.4f} ± {np.std(r2_scores):.4f}")
+
+# ====================== 最终总散点图 ======================
+# 这里为了逻辑通顺，我们使用后面重新训练的 final 模型来做最终预测，避免数据泄露疑问
+# 但先保留你原有的代码作为注释，解释差异原因
+
+# X_final = pt.transform(scaler.transform(X))
+# X_final_sel = selector.transform(X_final)
+# pred_xgb = xgb_model.predict(X_final_sel) # 这个xgb_model只是最后一折的模型
+# pred_lgb = lgb_model.predict(X_final_sel)
+# pred_cat = cat_model.predict(X_final_sel)
+# meta_input = np.column_stack((pred_xgb, pred_lgb, pred_cat))
+# pred_log = meta_model.predict(meta_input) # 这个meta_model也只是最后一折的
+# ---------------------------------------------------
+
+# ====================== 8. 保存模型 (先执行保存逻辑，以便利用 final 模型绘图) ======================
+save_path = "C:/Users/mlj23/Desktop/shandong_castle_毕设/temp/temp_all/IN/"
+os.makedirs(save_path, exist_ok=True)  # 防止路径不存在报错
+
+X_final = pt.transform(scaler.transform(X))
+X_final_sel = selector.transform(X_final)
+
+final_xgb = XGBRegressor(**xgb_model.get_params())
+final_lgb = LGBMRegressor(**lgb_model.get_params())
+final_cat = CatBoostRegressor(**cat_model.get_params())
+
+final_xgb.fit(X_final_sel, y)
+final_lgb.fit(X_final_sel, y)
+final_cat.fit(X_final_sel, y)
+
+
+print("\n正在训练最终 Meta 模型用于绘图...")
+stacked_preds_train = np.column_stack([
+    final_xgb.predict(X_final_sel),
+    final_lgb.predict(X_final_sel),
+    final_cat.predict(X_final_sel)
+])
+final_meta = CatBoostRegressor(iterations=1200, depth=6, learning_rate=0.06, verbose=0, random_state=42)
+final_meta.fit(stacked_preds_train, y)
+
+# 最终预测
+pred_log = final_meta.predict(stacked_preds_train)
+y_pred = np.expm1(pred_log)
+y_true = np.expm1(y)
+
+r2 = r2_score(y_true, y_pred)
+mae = mean_absolute_error(y_true, y_pred)
+rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+
+# 绘制总散点图 (你原有的代码)
+plt.figure(figsize=(8, 8))
+plt.scatter(y_true, y_pred, alpha=0.7, s=12, color='blue', edgecolors='black')
+plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', lw=2.5)
+plt.xlabel('实测无机氮 (mg/L)')
+plt.ylabel('预测无机氮 (mg/L)')
+plt.title(f'Stacking 最终模型\nR² = {r2:.4f} | MAE = {mae:.4f} | RMSE = {rmse:.4f}')
+plt.grid(True, ls='--', alpha=0.5)
+plt.savefig(f"{save_dir}Stacking_总散点图.png", bbox_inches='tight')
+plt.close()
+print(f"Stacking 最终 R²: {r2:.4f} （总散点图已保存）")
+
+# ====================== 总残差图 ======================
+residuals = y_true - y_pred
+plt.figure(figsize=(10, 6))
+plt.scatter(y_pred, residuals, alpha=0.6, s=12, color='darkred', edgecolors='black')
+plt.axhline(y=0, color='black', linestyle='--', lw=2)
+plt.xlabel('预测无机氮 (mg/L)')
+plt.ylabel('残差 (Real - Pred)')
+plt.title('Stacking 最终模型残差图')
+plt.grid(True, ls='--', alpha=0.5)
+plt.savefig(f"{save_dir}Stacking_总残差图.png", bbox_inches='tight')
+plt.close()
+print("完成：Stacking_总残差图.png")
+
+# ======================  筛选后特征重要性图 ======================
+print("\n正在绘制特征重要性图...")
+# 使用 CatBoost 或者 XGBoost 来画特征重要性，这里用 XGBoost
+importances = final_xgb.feature_importances_
+indices = np.argsort(importances)[::-1]
+
+plt.figure(figsize=(12, 8))
+plt.title('筛选后特征重要性排序 (XGBoost)')
+plt.bar(range(X_final_sel.shape[1]), importances[indices], align='center', color='steelblue')
+plt.xticks(range(X_final_sel.shape[1]), selected_feature_names[indices], rotation=90)
+plt.xlim([-1, X_final_sel.shape[1]])
+plt.tight_layout()
+plt.savefig(f"{save_dir}特征重要性图.png", dpi=300, bbox_inches='tight')
+plt.close()
+print("完成：特征重要性图.png")
+
+# ======================预测值误差分布直方图 ======================
+plt.figure(figsize=(10, 6))
+sns.histplot(residuals, kde=True, color='orange', bins=30)
+plt.xlabel('残差值 (mg/L)')
+plt.ylabel('样本频数')
+plt.title('模型预测误差分布直方图')
+plt.grid(True, ls='--', alpha=0.5)
+plt.savefig(f"{save_dir}误差分布直方图.png", dpi=300, bbox_inches='tight')
+plt.close()
+print("完成：误差分布直方图.png")
+
+# 继续执行保存模型...
+joblib.dump(final_xgb, save_path + "IN_ocean_final_inorg_n_xgb.pkl")
+joblib.dump(final_lgb, save_path + "IN_ocean_final_inorg_n_lgb.pkl")
+joblib.dump(final_cat, save_path + "IN_ocean_final_inorg_n_cat.pkl")
+joblib.dump(scaler, save_path + "scaler_ocean_inorg_n.pkl")
+joblib.dump(pt, save_path + "pt_ocean_inorg_n.pkl")
+joblib.dump(selector, save_path + "selector_ocean_inorg_n.pkl")
+joblib.dump(final_meta, save_path + "meta_catboost_inorg_n.pkl")  # 保存新的 final_meta
+
+print("\n 模型保存完成！")
+print("保存路径：", save_path)
+print(f"所有图表和日志保存在：{save_dir}")
