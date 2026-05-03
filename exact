@@ -7,18 +7,18 @@ import numpy as np
 from tqdm import tqdm
 
 # 环境配置
-gdal_dll_path = r"C:\app\anaconda\envs\unet2\Library\bin"
+gdal_dll_path = r
 if gdal_dll_path not in os.environ["PATH"]:
     os.environ["PATH"] = gdal_dll_path + ";" + os.environ["PATH"]
 
-osgeo_path = r"C:\app\anaconda\envs\unet2\Lib\site-packages\osgeo"
+osgeo_path = r
 if osgeo_path not in sys.path:
     sys.path.insert(0, osgeo_path)
 
 # 核心参数配置（仅改INPUT_XLS_PATH为你的新Excel路径，其他不变）
-TIF_IMAGE_PATH = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/remote_image/2020_10/202010tif.tif"
-INPUT_XLS_PATH = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/point/2020/extract/2020_10_extract.xls"
-OUTPUT_XLS_PATH = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/point/2020/extract/2020_10_result.xlsx"
+TIF_IMAGE_PATH = r
+INPUT_XLS_PATH = r
+OUTPUT_XLS_PATH = r
 
 # 坐标列（关键修改：适配新Excel的“实测经度”“实测纬度”列，按列名匹配，无需记索引）
 LONGITUDE_COL_NAME = "经度"  # 新Excel的经度列名
