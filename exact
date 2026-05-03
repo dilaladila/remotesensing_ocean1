@@ -1,0 +1,210 @@
+import os
+import sys
+import re
+from osgeo import gdal, osr
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+# 环境配置
+gdal_dll_path = r"C:\app\anaconda\envs\unet2\Library\bin"
+if gdal_dll_path not in os.environ["PATH"]:
+    os.environ["PATH"] = gdal_dll_path + ";" + os.environ["PATH"]
+
+osgeo_path = r"C:\app\anaconda\envs\unet2\Lib\site-packages\osgeo"
+if osgeo_path not in sys.path:
+    sys.path.insert(0, osgeo_path)
+
+# 核心参数配置（仅改INPUT_XLS_PATH为你的新Excel路径，其他不变）
+TIF_IMAGE_PATH = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/remote_image/2020_10/202010tif.tif"
+INPUT_XLS_PATH = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/point/2020/extract/2020_10_extract.xls"
+OUTPUT_XLS_PATH = r"C:/Users/mlj23/Desktop/shandong_castle_毕设/point/2020/extract/2020_10_result.xlsx"
+
+# 坐标列（关键修改：适配新Excel的“实测经度”“实测纬度”列，按列名匹配，无需记索引）
+LONGITUDE_COL_NAME = "经度"  # 新Excel的经度列名
+LATITUDE_COL_NAME = "纬度"   # 新Excel的纬度列名
+
+
+# 辅助函数：清理坐标（修复：允许负号）
+def clean_coordinate_value(coord_val):
+    if pd.isna(coord_val):
+        return np.nan
+    coord_str = str(coord_val).strip()
+    clean_str = re.sub(r'[^\d.-]', '', coord_str)  # 允许负号
+    try:
+        return float(clean_str) if clean_str else np.nan
+    except:
+        return np.nan
+
+
+# 辅助函数：获取影像范围
+def get_image_extent(tif_ds):
+    """计算影像的经纬度范围"""
+    geo_transform = tif_ds.GetGeoTransform()
+    width = tif_ds.RasterXSize
+    height = tif_ds.RasterYSize
+
+    # 计算影像四角坐标
+    min_x = geo_transform[0]
+    max_x = geo_transform[0] + width * geo_transform[1]
+    max_y = geo_transform[3]
+    min_y = geo_transform[3] + height * geo_transform[5]
+
+    # 确保坐标顺序正确
+    if min_x > max_x:
+        min_x, max_x = max_x, min_x
+    if min_y > max_y:
+        min_y, max_y = max_y, min_y
+
+    return (min_x, max_x, min_y, max_y)
+
+
+# 主处理流程
+if __name__ == "__main__":
+    print("=" * 50)
+    print("改进的GDAL直接点查询模式（适配新Excel列名）")
+    print("=" * 50)
+
+    # 测试GDAL
+    try:
+        print(f"GDAL版本：{gdal.__version__}")
+    except:
+        print("GDAL加载失败，请检查环境配置")
+
+    # 1. 检查文件并打开影像
+    print("\n1. 打开遥感影像...")
+    if not os.path.exists(TIF_IMAGE_PATH):
+        raise FileNotFoundError(f"文件不存在：{TIF_IMAGE_PATH}")
+    print(f"文件大小：{os.path.getsize(TIF_IMAGE_PATH)} bytes")
+
+    tif_ds = gdal.Open(TIF_IMAGE_PATH)
+    if tif_ds is None:
+        raise ValueError(f"影像读取失败：{TIF_IMAGE_PATH}")
+
+    total_bands = tif_ds.RasterCount
+    img_srs = osr.SpatialReference(wkt=tif_ds.GetProjectionRef())
+    img_proj_type = "投影坐标系" if img_srs.IsProjected() else "地理坐标系"
+    print(f"  影像坐标系类型：{img_proj_type}")
+    print(
+        f"  影像坐标系：{img_srs.GetAttrValue('projcs', 0)[:50] if img_srs.IsProjected() else img_srs.GetAttrValue('geogcs', 0)[:50]}")
+
+    # 获取影像范围
+    img_min_x, img_max_x, img_min_y, img_max_y = get_image_extent(tif_ds)
+    print(f"  影像X范围：{img_min_x:.6f} ~ {img_max_x:.6f}")
+    print(f"  影像Y范围：{img_min_y:.6f} ~ {img_max_y:.6f}")
+
+    # 2. 创建坐标转换（经纬度 → 影像坐标）
+    print("\n2. 初始化坐标转换...")
+    point_srs = osr.SpatialReference()
+    point_srs.ImportFromEPSG(4326)  # WGS84经纬度
+    transform = osr.CoordinateTransformation(point_srs, img_srs)
+
+    # 3. 读取并清理坐标表格（关键修改：按列名获取经纬度，不改动其他列）
+    print("\n3. 处理坐标表格...")
+    df = pd.read_excel(INPUT_XLS_PATH, header=0)
+    df = df.dropna(how='all')  # 只删全空白行，保留其他行
+    total_points = len(df)
+    print(f"  总数据行：{total_points}")
+
+    # 按列名获取经纬度，清理坐标（不改动原有经纬度列）
+    df["_clean_lon"] = df[LONGITUDE_COL_NAME].apply(clean_coordinate_value)
+    df["_clean_lat"] = df[LATITUDE_COL_NAME].apply(clean_coordinate_value)
+    valid_mask = (~pd.isna(df["_clean_lon"])) & (~pd.isna(df["_clean_lat"]))
+    valid_points = valid_mask.sum()
+    print(f"  有效坐标：{valid_points}")
+
+    # 计算坐标范围
+    if valid_points > 0:
+        coord_min_lon = df.loc[valid_mask, "_clean_lon"].min()
+        coord_max_lon = df.loc[valid_mask, "_clean_lon"].max()
+        coord_min_lat = df.loc[valid_mask, "_clean_lat"].min()
+        coord_max_lat = df.loc[valid_mask, "_clean_lat"].max()
+        print(f"  坐标经度范围：{coord_min_lon:.6f} ~ {coord_max_lon:.6f}")
+        print(f"  坐标纬度范围：{coord_min_lat:.6f} ~ {coord_max_lat:.6f}")
+    else:
+        print("  没有有效坐标可分析")
+
+    # 4. 准备波段列（仅新增波段列到最后，不改动原有任何列）
+    band_titles = [f"波段{i}" for i in range(1, total_bands + 1)]
+    for title in band_titles:
+        df[title] = ""  # 新增波段列，初始为空
+    df["错误原因"] = ""  # 新增错误原因列（方便排查失败情况）
+
+    # 5. 使用GDAL的ReadAsArray直接查询点值（完全不变）
+    print("\n4. 提取波段值...")
+    success_count = 0
+    geo_transform = tif_ds.GetGeoTransform()  # 提前获取GeoTransform
+    if geo_transform[1] == 0 or geo_transform[5] == 0:
+        raise ValueError("GeoTransform无效（分辨率0）")
+
+    for idx in tqdm(df[valid_mask].index, total=valid_points):
+        lon = df.loc[idx, "_clean_lon"]
+        lat = df.loc[idx, "_clean_lat"]
+        error_reason = ""
+
+        try:
+            # 转换坐标（经纬度 -> 影像投影坐标）
+            x_geo, y_geo, _ = transform.TransformPoint(lon, lat)
+            error_reason += f"转换后坐标:({x_geo:.2f},{y_geo:.2f}); "
+
+            # 检查是否在影像范围内（用投影坐标）
+            if not (img_min_x <= x_geo <= img_max_x and img_min_y <= y_geo <= img_max_y):
+                error_reason += "坐标超出影像范围; "
+                raise Exception("坐标超出影像范围")
+
+            # 转换为像素索引
+            x_pixel = int((x_geo - geo_transform[0]) / geo_transform[1])
+            y_pixel = int((y_geo - geo_transform[3]) / geo_transform[5])
+            error_reason += f"像素位置:({x_pixel},{y_pixel}); "
+
+            # 检查像素是否在栅格内
+            if not (0 <= x_pixel < tif_ds.RasterXSize and 0 <= y_pixel < tif_ds.RasterYSize):
+                error_reason += "像素超出栅格范围; "
+                raise Exception("像素超出栅格范围")
+
+            # 逐波段读取
+            data = np.full(total_bands, np.nan, dtype=np.float32)
+            for i in range(total_bands):
+                band = tif_ds.GetRasterBand(i + 1)
+                pixel_value = band.ReadAsArray(x_pixel, y_pixel, 1, 1)[0, 0]
+                data[i] = pixel_value if pixel_value is not None else np.nan
+
+            # 保存结果（仅填充波段列，不改动其他列）
+            for i in range(total_bands):
+                df.loc[idx, f"波段{i + 1}"] = data[i] if not np.isnan(data[i]) else "NoData"
+            success_count += 1
+            df.loc[idx, "错误原因"] = "成功"
+
+        except Exception as e:
+            error_reason += f"错误: {str(e)[:50]}"
+            df.loc[idx, "错误原因"] = error_reason
+            for band_idx in range(1, total_bands + 1):
+                df.loc[idx, f"波段{band_idx}"] = "查询失败"
+
+            # 关键错误提示
+            if "Invalid latitude" in str(e):
+                print(f"\n  点（经{lon:.2f}, 纬{lat:.2f}）：纬度超出UTM范围")
+            elif "超出影像范围" in str(e):
+                pass  # 不重复提示，结果中会显示
+            else:
+                print(f"\n  点（经{lon:.2f}, 纬{lat:.2f}）：{str(e)[:50]}")
+
+    # 6. 保存结果
+    df = df.drop(columns=["_clean_lon", "_clean_lat"], errors="ignore")  # 只删临时列
+    try:
+        df.to_excel(OUTPUT_XLS_PATH, index=False, engine="openpyxl")
+        print(f"\n结果保存至：{OUTPUT_XLS_PATH}")
+    except Exception as e:
+        csv_path = OUTPUT_XLS_PATH.replace(".xlsx", ".csv")
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        print(f"\nExcel保存失败，已转为CSV：{csv_path} (错误：{str(e)[:30]})")
+
+    print(f"\n成功提取：{success_count}/{valid_points}")
+    print(f"影像范围：X[{img_min_x:.2f}, {img_max_x:.2f}], Y[{img_min_y:.2f}, {img_max_y:.2f}]")
+    if valid_points > 0:
+        print(
+            f"坐标范围：经度[{coord_min_lon:.2f}, {coord_max_lon:.2f}], 纬度[{coord_min_lat:.2f}, {coord_max_lat:.2f}]")
+
+    # 清理资源
+    tif_ds = None
+    print("\n处理完成")
