@@ -1,0 +1,220 @@
+import rasterio
+import numpy as np
+import pandas as pd
+import joblib
+import os
+import warnings
+from tqdm import tqdm
+
+warnings.filterwarnings('ignore')
+
+print("【无机氮】批量大影像分块预测 - 兼容TIF/ENVI双格式")
+
+# ====================== 1. 加载模型 ======================
+model_dir = r"C:/Users/"
+
+xgb_model = joblib.load(model_dir + "IN_ocean_final_inorg_n_xgb.pkl")
+lgb_model = joblib.load(model_dir + "IN_ocean_final_inorg_n_lgb.pkl")
+cat_model = joblib.load(model_dir + "IN_ocean_final_inorg_n_cat.pkl")
+scaler = joblib.load(model_dir + "scaler_ocean_inorg_n.pkl")
+pt = joblib.load(model_dir + "pt_ocean_inorg_n.pkl")
+selector = joblib.load(model_dir + "selector_ocean_inorg_n.pkl")
+meta_model = joblib.load(model_dir + "meta_catboost_inorg_n.pkl")
+
+print(" 模型加载成功")
+
+# ====================== 2. 输入输出文件夹（只改这里！）======================
+INPUT_DIR = r"C:"  # 输入文件夹
+OUTPUT_DIR = r""  # 输出文件夹
+
+# 自动创建输出文件夹
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# ====================== 3. 单张影像预测函数（原代码完全不变）======================
+def predict_single_image(input_path, output_path):
+    # 全局经纬度统计
+    print(f"\n正在处理: {os.path.basename(input_path)}")
+    print("正在计算全局经纬度 mean/std ...")
+    with rasterio.open(input_path) as src:
+        transform = src.transform
+        height, width = src.height, src.width
+
+        rows_sample = np.linspace(0, height - 1, 5000, dtype=int)
+        cols_sample = np.linspace(0, width - 1, 5000, dtype=int)
+        rows_idx, cols_idx = np.meshgrid(rows_sample, cols_sample)
+        lon_sample, lat_sample = rasterio.transform.xy(transform, rows_idx.flatten(), cols_idx.flatten())
+        lon_sample = np.array(lon_sample, dtype=np.float32)
+        lat_sample = np.array(lat_sample, dtype=np.float32)
+
+        lon_mean = lon_sample.mean()
+        lon_std = lon_sample.std() + 1e-8
+        lat_mean = lat_sample.mean()
+        lat_std = lat_sample.std() + 1e-8
+
+    print(f"全局经度: mean={lon_mean:.4f}, std={lon_std:.4f}")
+    print(f"全局纬度: mean={lat_mean:.4f}, std={lat_std:.4f}")
+
+    # 分块预测
+    CHUNK_ROWS = 500
+    with rasterio.open(input_path) as src:
+        profile = src.profile.copy()
+        profile.update(count=1, dtype=rasterio.float32, nodata=np.nan)
+
+        # 自动创建输出文件的父文件夹
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        with rasterio.open(output_path, 'w', **profile) as dst:
+            for start_row in tqdm(range(0, height, CHUNK_ROWS), desc="处理影像"):
+                end_row = min(start_row + CHUNK_ROWS, height)
+                window_height = end_row - start_row
+                window = rasterio.windows.Window(0, start_row, width, window_height)
+
+                data = src.read(window=window)
+                bands = data.reshape(7, -1).T.astype(np.float32)
+
+                rows_idx = np.arange(start_row, end_row).repeat(width)
+                cols_idx = np.tile(np.arange(width), window_height)
+
+                lon, lat = rasterio.transform.xy(transform, rows_idx, cols_idx)
+                lon = np.array(lon, dtype=np.float32)
+                lat = np.array(lat, dtype=np.float32)
+
+                # ====================== 构建特征（原代码完全不变）======================
+                B1, B2, B3, B4, B5, B6, B7 = [bands[:, i] for i in range(7)]
+
+                feature_dict = {
+                    'B1': B1, 'B2': B2, 'B3': B3, 'B4': B4, 'B5': B5, 'B6': B6, 'B7': B7,
+                }
+
+                bands_list = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']
+                for i in range(7):
+                    for j in range(i + 1, 7):
+                        feature_dict[f'r_{bands_list[i]}_{bands_list[j]}'] = feature_dict[bands_list[i]] / (
+                                feature_dict[bands_list[j]] + 1e-8)
+                        feature_dict[f'd_{bands_list[i]}_{bands_list[j]}'] = feature_dict[bands_list[i]] - feature_dict[
+                            bands_list[j]]
+                        feature_dict[f'm_{bands_list[i]}_{bands_list[j]}'] = feature_dict[bands_list[i]] * feature_dict[
+                            bands_list[j]]
+
+                feature_dict['NDVI'] = (B5 - B4) / (B5 + B4 + 1e-8)
+                feature_dict['NDWI'] = (B5 - B6) / (B5 + B6 + 1e-8)
+                feature_dict['NDTI'] = (B6 - B7) / (B6 + B7 + 1e-8)
+                feature_dict['EVI'] = 2.5 * (B5 - B4) / (B5 + 6 * B4 - 7.5 * B2 + 1 + 1e-8)
+                feature_dict['FLH'] = B5 - (B4 + (B6 - B4) * (665 - 655) / (740 - 655))
+
+                for col in ['B2', 'B3', 'B4', 'B5']:
+                    feature_dict[f'{col}_sq'] = feature_dict[col] ** 2
+                    feature_dict[f'{col}_log'] = np.log1p(feature_dict[col])
+
+                feature_dict['B5_B4_ratio'] = B5 / (B4 + 1e-8)
+                feature_dict['B5_B2_ratio'] = B5 / (B2 + 1e-8)
+
+                feature_dict['lon_norm'] = (lon - lon_mean) / lon_std
+                feature_dict['lat_norm'] = (lat - lat_mean) / lat_std
+                feature_dict['lon_lat'] = feature_dict['lon_norm'] * feature_dict['lat_norm']
+
+                X_pred = pd.DataFrame(feature_dict)
+
+                # ====================== 关键修复：补全 scaler 训练时所有列 ======================
+                if hasattr(scaler, 'feature_names_in_'):
+                    expected_cols = scaler.feature_names_in_
+                    for col in expected_cols:
+                        if col not in X_pred.columns:
+                            if col == '经度':
+                                X_pred[col] = lon
+                            elif col == '纬度':
+                                X_pred[col] = lat
+                            else:
+                                X_pred[col] = 0.0
+                    X_pred = X_pred[expected_cols]
+                else:
+                    print("警告：scaler 没有 feature_names_in_ 属性")
+
+                # ====================== 预测 ======================
+                X_scaled = scaler.transform(X_pred)
+                X_pt = pt.transform(X_scaled)
+                X_sel = selector.transform(X_pt)
+
+                pred_xgb = xgb_model.predict(X_sel)
+                pred_lgb = lgb_model.predict(X_sel)
+                pred_cat = cat_model.predict(X_sel)
+
+                meta_input = np.column_stack((pred_xgb, pred_lgb, pred_cat))
+                pred_log = meta_model.predict(meta_input)
+                pred_chunk = np.expm1(pred_log)
+
+                pred_chunk = pred_chunk.reshape((window_height, width)).astype(np.float32)
+                dst.write(pred_chunk, 1, window=window)
+
+    print(f" 完成: {os.path.basename(output_path)}")
+
+
+# ====================== 4. ENVI数据文件寻找函数 ======================
+def find_envi_data_file(hdr_path):
+    base_path = os.path.splitext(hdr_path)[0]
+    possible_exts = ['.dat', '.img', '.raw', '.bil', '.bsq', '.bip', '']
+    for ext in possible_exts:
+        candidate = base_path + ext
+        if os.path.exists(candidate) and os.path.isfile(candidate):
+            if not candidate.lower().endswith('.hdr'):
+                return candidate
+    return None
+
+
+# ====================== 5自动识别TIF+ENVI双格式 ======================
+image_files = []
+processed_base_names = set()  # 防止重复处理（比如hdr和dat同时存在）
+
+for file in os.listdir(INPUT_DIR):
+    file_lower = file.lower()
+    full_path = os.path.join(INPUT_DIR, file)
+    base_name = os.path.splitext(file)[0]
+
+    # 跳过已经处理过的同名文件
+    if base_name in processed_base_names:
+        continue
+
+    # 1. 优先处理TIF格式
+    if file_lower.endswith('.tif') or file_lower.endswith('.tiff'):
+        image_files.append(full_path)
+        processed_base_names.add(base_name)
+        print(f" 找到TIF影像: {file}")
+
+    # 2. 处理ENVI格式
+    elif file_lower.endswith('.hdr'):
+        data_file = find_envi_data_file(full_path)
+        if data_file:
+            image_files.append(data_file)
+            processed_base_names.add(base_name)
+            print(f" 找到ENVI影像: {file} -> {os.path.basename(data_file)}")
+        else:
+            print(f"  跳过: {file} (未找到对应的数据文件)")
+
+if not image_files:
+    print("❌ 输入文件夹中没有找到有效的TIF/ENVI影像！")
+    exit()
+
+print(f"\n共找到 {len(image_files)} 张待处理影像")
+
+# 批量处理
+for idx, input_file in enumerate(image_files, 1):
+    print(f"\n======================================")
+    print(f"正在处理第 {idx}/{len(image_files)} 张影像")
+
+    # 生成输出文件名
+    base_name = os.path.splitext(os.path.basename(input_file))[0]
+    output_file = os.path.join(OUTPUT_DIR, f"{base_name}_无机氮反演结果.tif")
+
+    try:
+        predict_single_image(input_file, output_file)
+    except Exception as e:
+        print(f"❌ 处理失败: {os.path.basename(input_file)}")
+        print(f"错误信息: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        continue
+
+print("\n======================================")
+print(f" 全部处理完成！结果已保存至：")
+print(OUTPUT_DIR)
